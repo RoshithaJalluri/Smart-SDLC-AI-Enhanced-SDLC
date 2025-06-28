@@ -1,0 +1,383 @@
+# feedback_model.py
+import json
+import sqlite3
+from datetime import datetime
+from typing import Dict, List, Optional, Union
+import pandas as pd
+from dataclasses import dataclass, asdict
+import uuid
+
+@dataclass
+class FeedbackData:
+    """Data class for storing feedback information"""
+    feedback_id: str
+    user_id: str
+    module_name: str  # e.g., 'code_generator', 'bug_resolver', 'doc_generator'
+    input_data: str   # Original user input
+    ai_output: str    # AI-generated output
+    rating: int       # 1-5 star rating
+    feedback_text: str  # User's written feedback
+    feedback_type: str  # 'positive', 'negative', 'suggestion'
+    timestamp: str
+    session_id: str
+    improvement_suggestions: Optional[str] = None
+
+class FeedbackModel:
+    """Model class for handling feedback data operations"""
+    
+    def __init__(self, db_path: str = "smart_sdlc_feedback.db"):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize SQLite database for feedback storage"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS feedback (
+                feedback_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                module_name TEXT NOT NULL,
+                input_data TEXT NOT NULL,
+                ai_output TEXT NOT NULL,
+                rating INTEGER NOT NULL CHECK (rating >= 1 AND rating <= 5),
+                feedback_text TEXT,
+                feedback_type TEXT CHECK (feedback_type IN ('positive', 'negative', 'suggestion')),
+                timestamp TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                improvement_suggestions TEXT
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS feedback_analytics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                module_name TEXT NOT NULL,
+                avg_rating REAL,
+                total_feedback INTEGER,
+                positive_count INTEGER,
+                negative_count INTEGER,
+                suggestion_count INTEGER,
+                last_updated TEXT
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def save_feedback(self, feedback: FeedbackData) -> bool:
+        """Save feedback to database"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO feedback VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                feedback.feedback_id,
+                feedback.user_id,
+                feedback.module_name,
+                feedback.input_data,
+                feedback.ai_output,
+                feedback.rating,
+                feedback.feedback_text,
+                feedback.feedback_type,
+                feedback.timestamp,
+                feedback.session_id,
+                feedback.improvement_suggestions
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            # Update analytics
+            self.update_analytics(feedback.module_name)
+            return True
+            
+        except Exception as e:
+            print(f"Error saving feedback: {e}")
+            return False
+    
+    def get_feedback_by_module(self, module_name: str) -> List[Dict]:
+        """Retrieve feedback for a specific module"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM feedback WHERE module_name = ?
+            ORDER BY timestamp DESC
+        ''', (module_name,))
+        
+        results = cursor.fetchall()
+        conn.close()
+        
+        columns = ['feedback_id', 'user_id', 'module_name', 'input_data', 
+                  'ai_output', 'rating', 'feedback_text', 'feedback_type', 
+                  'timestamp', 'session_id', 'improvement_suggestions']
+        
+        return [dict(zip(columns, row)) for row in results]
+    
+    def update_analytics(self, module_name: str):
+        """Update analytics for a module"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Get statistics
+        cursor.execute('''
+            SELECT 
+                AVG(rating) as avg_rating,
+                COUNT(*) as total_feedback,
+                SUM(CASE WHEN feedback_type = 'positive' THEN 1 ELSE 0 END) as positive_count,
+                SUM(CASE WHEN feedback_type = 'negative' THEN 1 ELSE 0 END) as negative_count,
+                SUM(CASE WHEN feedback_type = 'suggestion' THEN 1 ELSE 0 END) as suggestion_count
+            FROM feedback WHERE module_name = ?
+        ''', (module_name,))
+        
+        stats = cursor.fetchone()
+        
+        # Update or insert analytics
+        cursor.execute('''
+            INSERT OR REPLACE INTO feedback_analytics 
+            (module_name, avg_rating, total_feedback, positive_count, negative_count, suggestion_count, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (module_name, stats[0], stats[1], stats[2], stats[3], stats[4], datetime.now().isoformat()))
+        
+        conn.commit()
+        conn.close()
+
+# feedback_routes.py
+import gradio as gr
+from feedback_model import FeedbackModel, FeedbackData
+import uuid
+from datetime import datetime
+import json
+
+class FeedbackHandler:
+    """Handler class for feedback operations in Gradio interface"""
+    
+    def __init__(self):
+        self.feedback_model = FeedbackModel()
+        self.current_session = str(uuid.uuid4())
+    
+    def collect_feedback(self, 
+                        user_id: str,
+                        module_name: str, 
+                        input_data: str, 
+                        ai_output: str, 
+                        rating: int, 
+                        feedback_text: str, 
+                        feedback_type: str,
+                        improvement_suggestions: str = None) -> str:
+        """Collect and save user feedback"""
+        
+        try:
+            feedback = FeedbackData(
+                feedback_id=str(uuid.uuid4()),
+                user_id=user_id or "anonymous",
+                module_name=module_name,
+                input_data=input_data,
+                ai_output=ai_output,
+                rating=rating,
+                feedback_text=feedback_text,
+                feedback_type=feedback_type,
+                timestamp=datetime.now().isoformat(),
+                session_id=self.current_session,
+                improvement_suggestions=improvement_suggestions
+            )
+            
+            success = self.feedback_model.save_feedback(feedback)
+            
+            if success:
+                return "✅ Thank you for your feedback! It will help us improve the AI models."
+            else:
+                return "❌ Error saving feedback. Please try again."
+                
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def get_module_analytics(self, module_name: str) -> str:
+        """Get analytics for a specific module"""
+        try:
+            feedback_data = self.feedback_model.get_feedback_by_module(module_name)
+            
+            if not feedback_data:
+                return f"No feedback data available for {module_name}"
+            
+            total_feedback = len(feedback_data)
+            avg_rating = sum(item['rating'] for item in feedback_data) / total_feedback
+            
+            positive_count = sum(1 for item in feedback_data if item['feedback_type'] == 'positive')
+            negative_count = sum(1 for item in feedback_data if item['feedback_type'] == 'negative')
+            suggestion_count = sum(1 for item in feedback_data if item['feedback_type'] == 'suggestion')
+            
+            analytics = f"""
+📊 **Feedback Analytics for {module_name}**
+
+📈 **Overall Statistics:**
+- Total Feedback: {total_feedback}
+- Average Rating: {avg_rating:.2f}/5.0 ⭐
+- Positive Feedback: {positive_count} ({positive_count/total_feedback*100:.1f}%)
+- Negative Feedback: {negative_count} ({negative_count/total_feedback*100:.1f}%)
+- Suggestions: {suggestion_count} ({suggestion_count/total_feedback*100:.1f}%)
+
+📝 **Recent Feedback:**
+"""
+            
+            # Add recent feedback (last 3)
+            for item in feedback_data[:3]:
+                analytics += f"\n- **Rating:** {item['rating']}/5 | **Type:** {item['feedback_type']}\n"
+                analytics += f"  **Feedback:** {item['feedback_text'][:100]}...\n"
+            
+            return analytics
+            
+        except Exception as e:
+            return f"Error retrieving analytics: {str(e)}"
+    
+    def export_feedback_data(self, module_name: str = None) -> str:
+        """Export feedback data for analysis"""
+        try:
+            if module_name:
+                feedback_data = self.feedback_model.get_feedback_by_module(module_name)
+                filename = f"feedback_export_{module_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            else:
+                # Export all feedback (you'd need to implement this in FeedbackModel)
+                feedback_data = []
+                filename = f"feedback_export_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            
+            with open(filename, 'w') as f:
+                json.dump(feedback_data, f, indent=2)
+            
+            return f"✅ Feedback data exported to {filename}"
+            
+        except Exception as e:
+            return f"❌ Error exporting data: {str(e)}"
+
+# Gradio Interface Components
+def create_feedback_interface():
+    """Create Gradio interface for feedback collection"""
+    
+    feedback_handler = FeedbackHandler()
+    
+    with gr.Blocks(title="Smart SDLC - Feedback System") as feedback_interface:
+        
+        gr.Markdown("# 📋 Smart SDLC Feedback System")
+        gr.Markdown("Help us improve our AI models by providing feedback on generated outputs!")
+        
+        with gr.Tab("Submit Feedback"):
+            with gr.Row():
+                with gr.Column():
+                    user_id_input = gr.Textbox(label="User ID (Optional)", placeholder="Enter your user ID")
+                    module_select = gr.Dropdown(
+                        choices=["code_generator", "bug_resolver", "doc_generator", "ai_story_generator", "test_generator"],
+                        label="Module Name",
+                        value="code_generator"
+                    )
+                    
+                with gr.Column():
+                    rating_slider = gr.Slider(minimum=1, maximum=5, step=1, label="Rating (1-5 stars)", value=3)
+                    feedback_type_radio = gr.Radio(
+                        choices=["positive", "negative", "suggestion"],
+                        label="Feedback Type",
+                        value="positive"
+                    )
+            
+            input_data_text = gr.Textbox(
+                label="Original Input",
+                placeholder="Paste the original input you provided to the AI...",
+                lines=3
+            )
+            
+            ai_output_text = gr.Textbox(
+                label="AI Generated Output",
+                placeholder="Paste the AI-generated output...",
+                lines=5
+            )
+            
+            feedback_text_area = gr.Textbox(
+                label="Your Feedback",
+                placeholder="Please provide detailed feedback about the AI output...",
+                lines=4
+            )
+            
+            improvement_text = gr.Textbox(
+                label="Improvement Suggestions (Optional)",
+                placeholder="Any specific suggestions for improvement?",
+                lines=2
+            )
+            
+            submit_btn = gr.Button("Submit Feedback", variant="primary")
+            feedback_result = gr.Textbox(label="Result", interactive=False)
+            
+            submit_btn.click(
+                feedback_handler.collect_feedback,
+                inputs=[user_id_input, module_select, input_data_text, ai_output_text, 
+                       rating_slider, feedback_text_area, feedback_type_radio, improvement_text],
+                outputs=feedback_result
+            )
+        
+        with gr.Tab("Analytics Dashboard"):
+            analytics_module_select = gr.Dropdown(
+                choices=["code_generator", "bug_resolver", "doc_generator", "ai_story_generator", "test_generator"],
+                label="Select Module for Analytics",
+                value="code_generator"
+            )
+            
+            analytics_btn = gr.Button("Get Analytics")
+            analytics_output = gr.Markdown()
+            
+            analytics_btn.click(
+                feedback_handler.get_module_analytics,
+                inputs=analytics_module_select,
+                outputs=analytics_output
+            )
+            
+            export_btn = gr.Button("Export Feedback Data")
+            export_result = gr.Textbox(label="Export Result", interactive=False)
+            
+            export_btn.click(
+                feedback_handler.export_feedback_data,
+                inputs=analytics_module_select,
+                outputs=export_result
+            )
+    
+    return feedback_interface
+
+# Integration example for your main application
+def integrate_feedback_to_module(module_output: str, module_name: str, user_input: str, user_id: str = None):
+    """
+    Function to integrate feedback collection into your existing modules
+    Call this function after generating AI output in your modules
+    """
+    
+    feedback_handler = FeedbackHandler()
+    
+    # Create a simple feedback interface that can be embedded
+    with gr.Row():
+        with gr.Column(scale=3):
+            gr.Markdown("### Quick Feedback")
+            quick_rating = gr.Slider(1, 5, 3, label="Rate this output")
+            quick_feedback = gr.Textbox(label="Quick feedback", lines=2)
+            quick_submit = gr.Button("Submit", size="sm")
+            
+            def quick_feedback_submit(rating, feedback_text):
+                return feedback_handler.collect_feedback(
+                    user_id or "anonymous",
+                    module_name,
+                    user_input,
+                    module_output,
+                    rating,
+                    feedback_text,
+                    "positive" if rating >= 4 else "negative"
+                )
+            
+            quick_submit.click(
+                quick_feedback_submit,
+                inputs=[quick_rating, quick_feedback],
+                outputs=gr.Textbox(label="Result")
+            )
+
+if __name__ == "__main__":
+    # Launch the feedback interface
+    feedback_app = create_feedback_interface()
+    feedback_app.launch(debug=True, share=True)
